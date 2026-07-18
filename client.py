@@ -87,8 +87,8 @@ SAMPLE_RATE = 16000
 SAMPLES_PER_FRAME = 320  # 20ms of audio per RTP packet
 FRAME_INTERVAL = SAMPLES_PER_FRAME / SAMPLE_RATE
 
-MIC_GAIN = 4.0
-PLAYBACK_GAIN = 2.5
+MIC_GAIN = 1.0
+PLAYBACK_GAIN = 1.0
 
 # Jitter buffer: how many 20ms frames we hold before playing. Larger = more
 # tolerant of jitter/loss, but adds latency.
@@ -144,41 +144,38 @@ class JitterBuffer:
     def __init__(self, size=SAMPLES_PER_FRAME, delay_frames=JITTER_FRAMES):
         self.size = size
         self.delay = max(1, delay_frames)
-        # Buffered frames keyed by sequence number, so we can release in order.
         self.buffered = {}
-        self.expected_seq = None      # next sequence number the player wants
-        self.started = False          # becomes True once we have enough to play
+        self.expected_seq = None
+        self.started = False
         self.last_good = np.zeros(size, dtype=np.int16)
         self.conceal_count = 0
+        self._lock = threading.Lock()
 
     def push(self, sequence_number, frame):
-        self.buffered[sequence_number] = frame
-        # Bound memory: drop the oldest outstanding sequence if we fall behind.
-        if len(self.buffered) > 64:
-            oldest = min(self.buffered)
-            self.buffered.pop(oldest, None)
+        with self._lock:
+            self.buffered[sequence_number] = frame
+            if len(self.buffered) > 64:
+                oldest = min(self.buffered)
+                self.buffered.pop(oldest, None)
 
     def pop(self):
-        """Returns the next frame in sequence order, concealing if missing."""
-        # Not enough buffered yet: keep filling the playout window.
-        if not self.started:
-            if len(self.buffered) < self.delay:
-                return self._conceal(playing=False)
-            # Prime: start at the lowest sequence we have.
-            self.expected_seq = min(self.buffered)
-            self.started = True
+        with self._lock:
+            if not self.started:
+                if len(self.buffered) < self.delay:
+                    return self._conceal(playing=False)
+                self.expected_seq = min(self.buffered)
+                self.started = True
 
-        seq = self.expected_seq
-        if seq in self.buffered:
-            frame = self.buffered.pop(seq)
+            seq = self.expected_seq
+            if seq in self.buffered:
+                frame = self.buffered.pop(seq)
+                self.expected_seq = (seq + 1) & 0xFFFF
+                self.last_good = frame
+                self.conceal_count = 0
+                return frame
+
             self.expected_seq = (seq + 1) & 0xFFFF
-            self.last_good = frame
-            self.conceal_count = 0
-            return frame
-
-        # The expected frame never arrived: conceal the gap and skip ahead.
-        self.expected_seq = (seq + 1) & 0xFFFF
-        return self._conceal(playing=True)
+            return self._conceal(playing=True)
 
     def _conceal(self, playing):
         if not playing:

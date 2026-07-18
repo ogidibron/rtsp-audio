@@ -28,6 +28,7 @@ import struct
 import threading
 import time
 import argparse
+from collections import deque
 import numpy as np
 
 
@@ -84,7 +85,7 @@ SAMPLE_RATE = 16000        # audio samples per second
 SAMPLES_PER_FRAME = 320    # 20ms of audio per RTP packet
 FRAME_INTERVAL = SAMPLES_PER_FRAME / SAMPLE_RATE  # seconds between audio frames
 
-MIX_GAIN = 2.5             # boost the mixed output so it is clearly audible
+MIX_GAIN = 1.5             # boost the mixed output so it is clearly audible
 
 HEARTBEAT_TIMEOUT = 8.0    # drop a client if no heartbeat for this long (seconds)
 HEARTBEAT_INTERVAL = 2.0   # how often clients are expected to send heartbeats
@@ -107,7 +108,7 @@ class ConnectedClient:
         self.ip_address = ip_address        # client's IP address
         self.rtp_port = rtp_port            # UDP port on the client that receives the mix
 
-        self.latest_audio_frame = None      # most recent mic audio received from this client
+        self.audio_frames = deque(maxlen=4)
         self.last_sequence = None           # last RTP sequence seen (for loss detection)
         self.lost_packets = 0
         self.received_packets = 0
@@ -266,7 +267,7 @@ def receive_audio_from_clients(audio_socket):
         with clients_lock:
             sender = connected_clients.get(ssrc)
             if sender is not None:
-                sender.latest_audio_frame = audio_bytes
+                sender.audio_frames.append(audio_bytes)
                 sender.return_address = addr
                 sender.last_heartbeat = time.time()
                 sender.received_packets += 1
@@ -350,6 +351,7 @@ def mix_and_send_audio(audio_socket):
     (everyone else's audio, minus their own and minus muted talkers) and
     sends it to them. Replies are sent from SERVER_RTP_PORT (symmetric RTP)."""
     silent_frame = np.zeros(SAMPLES_PER_FRAME, dtype=np.int32)
+    next_loop_time = time.time()
 
     while True:
         loop_start_time = time.time()
@@ -359,8 +361,10 @@ def mix_and_send_audio(audio_socket):
 
             frames_by_ssrc = {}
             for client in clients_snapshot:
-                audio = client.latest_audio_frame
-                client.latest_audio_frame = None
+                audio = None
+                if client.audio_frames:
+                    audio = client.audio_frames[-1]
+                    client.audio_frames.clear()
                 if audio is not None and len(audio) >= SAMPLES_PER_FRAME * 2:
                     frames_by_ssrc[client.ssrc] = np.frombuffer(
                         audio, dtype=np.int16
@@ -404,8 +408,13 @@ def mix_and_send_audio(audio_socket):
                 except OSError:
                     pass  # client's socket may have closed, ignore and continue
 
+        next_loop_time += FRAME_INTERVAL
         time_spent = time.time() - loop_start_time
-        time.sleep(max(0.0, FRAME_INTERVAL - time_spent))
+        sleep_time = next_loop_time - time.time()
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+        else:
+            next_loop_time = time.time()
 
 
 def discover_public_address(stun_host="stun.l.google.com", stun_port=19302, local_socket=None):
