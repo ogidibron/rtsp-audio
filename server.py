@@ -85,7 +85,7 @@ SAMPLE_RATE = 16000        # audio samples per second
 SAMPLES_PER_FRAME = 320    # 20ms of audio per RTP packet
 FRAME_INTERVAL = SAMPLES_PER_FRAME / SAMPLE_RATE  # seconds between audio frames
 
-MIX_GAIN = 1.5             # boost the mixed output so it is clearly audible
+MIX_GAIN = 1.8             # boost the mixed output so it is clearly audible
 
 HEARTBEAT_TIMEOUT = 8.0    # drop a client if no heartbeat for this long (seconds)
 HEARTBEAT_INTERVAL = 2.0   # how often clients are expected to send heartbeats
@@ -364,7 +364,6 @@ def mix_and_send_audio(audio_socket):
                 audio = None
                 if client.audio_frames:
                     audio = client.audio_frames[-1]
-                    client.audio_frames.clear()
                 if audio is not None and len(audio) >= SAMPLES_PER_FRAME * 2:
                     frames_by_ssrc[client.ssrc] = np.frombuffer(
                         audio, dtype=np.int16
@@ -383,7 +382,9 @@ def mix_and_send_audio(audio_socket):
                     # Normalize by the number of active talkers so a single
                     # voice isn't quiet and many voices don't clip.
                     mixed_frame = mixed_frame / len(other_frames)
-                    mixed_frame = (mixed_frame * MIX_GAIN).clip(-32768, 32767).astype(np.int16)
+                    mixed_frame = (mixed_frame * MIX_GAIN)
+                    mixed_frame = np.tanh(mixed_frame / 32768.0) * 32768.0
+                    mixed_frame = mixed_frame.clip(-32768, 32767).astype(np.int16)
                 else:
                     mixed_frame = np.zeros(SAMPLES_PER_FRAME, dtype=np.int16)
 

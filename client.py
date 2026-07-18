@@ -88,11 +88,11 @@ SAMPLES_PER_FRAME = 320  # 20ms of audio per RTP packet
 FRAME_INTERVAL = SAMPLES_PER_FRAME / SAMPLE_RATE
 
 MIC_GAIN = 1.0
-PLAYBACK_GAIN = 1.0
+PLAYBACK_GAIN = 1.2
 
 # Jitter buffer: how many 20ms frames we hold before playing. Larger = more
 # tolerant of jitter/loss, but adds latency.
-JITTER_FRAMES = 4
+JITTER_FRAMES = 6
 # If we miss this many consecutive frames, we still hold the last good frame.
 MAX_CONCEAL = 10
 
@@ -103,8 +103,8 @@ class AudioProcessor:
     """Microphone-side AGC + noise gate so quiet mics are normalized and
     background noise is silenced. Pure NumPy, no external dependencies."""
 
-    def __init__(self, target_peak=0.35, attack=0.02, release=0.002,
-                 noise_floor=0.01, gain_cap=12.0):
+    def __init__(self, target_peak=0.55, attack=0.02, release=0.002,
+                 noise_floor=0.005, gain_cap=12.0):
         self.target_peak = target_peak
         self.attack = attack
         self.release = release
