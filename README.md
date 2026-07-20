@@ -6,7 +6,8 @@ over TCP for call setup.
 
 ```
 server.py       - conference server (mixes audio, relays to clients)
-client.py   - client with Tkinter GUI + headless CLI mode
+client.py       - client with Tkinter GUI + headless CLI mode
+rtp.py          - shared RTP/control protocol helpers
 ```
 
 ## Requirements
@@ -30,8 +31,12 @@ Start a client (GUI):
 
 ```
 python client.py 127.0.0.1
-python client.py --server 127.0.0.1 --name Alice --device "Microphone"
+python client.py --server 127.0.0.1 --name Alice
 ```
+
+To select a specific audio device, pass its numeric ID (run the client once
+without `--device` to see the list printed in the GUI dropdown, or use
+`sounddevice.query_devices()` in Python):
 
 Headless CLI client (no GUI), useful for testing:
 

@@ -28,54 +28,19 @@ import struct
 import threading
 import time
 import argparse
+import signal
 from collections import deque
 import numpy as np
-
-
-RTP_VERSION = 2
-
-# RTP payload type for the audio (97 = dynamic; maps to L16 in SDP).
-PAYLOAD_TYPE = 97
-
-# Control message types sent over the same UDP socket as RTP audio.
-MSG_HEARTBEAT = 0x01   # client -> server: "I'm still here"
-MSG_MUTE = 0x02        # client -> server: toggle this client's mute
-MSG_ROSTER = 0x03      # server -> client: periodic participant list
-
-
-def build_rtp_packet(sequence_number, timestamp, ssrc, audio_bytes):
-    """Wraps raw audio bytes in a 12 byte RTP header."""
-    byte1 = (RTP_VERSION << 6) | (0 << 5) | (0 << 4)  # version, padding, extension
-    byte2 = PAYLOAD_TYPE
-    header = struct.pack(
-        "!BBHII",
-        byte1,
-        byte2,
-        sequence_number & 0xFFFF,
-        timestamp & 0xFFFFFFFF,
-        ssrc & 0xFFFFFFFF,
-    )
-    return header + audio_bytes
-
-
-def parse_rtp_packet(packet_bytes):
-    """Splits an RTP packet back into its header fields and audio bytes."""
-    header_bytes = packet_bytes[:12]
-    audio_bytes = packet_bytes[12:]
-    _, _, sequence_number, timestamp, ssrc = struct.unpack("!BBHII", header_bytes)
-    return ssrc, sequence_number, timestamp, audio_bytes
-
-
-def build_control_message(msg_type, payload=b""):
-    """A tiny control envelope: 1 byte type + 1 byte length + payload."""
-    return struct.pack("!BB", msg_type, len(payload)) + payload
-
-
-def parse_control_message(data):
-    if len(data) < 2:
-        return None, b""
-    msg_type, length = struct.unpack("!BB", data[:2])
-    return msg_type, data[2:2 + length]
+from rtp import (
+    build_rtp_packet,
+    parse_rtp_packet,
+    build_control_message,
+    parse_control_message,
+    MSG_HEARTBEAT,
+    MSG_MUTE,
+    MSG_ROSTER,
+    PAYLOAD_TYPE,
+)
 
 
 RTSP_PORT = 5540           # TCP port clients connect to for call setup
@@ -98,6 +63,8 @@ connected_clients = {}
 clients_lock = threading.Lock()
 
 next_ssrc = 1000  # simple counter used to hand out unique client ids
+next_ssrc_lock = threading.Lock()  # protects next_ssrc
+next_ssrc_lock = threading.Lock()  # protects next_ssrc
 
 
 class ConnectedClient:
@@ -121,6 +88,10 @@ class ConnectedClient:
 
         self.return_address = None          # NAT-translated (ip, port) we actually received from
         self.last_heartbeat = time.time()   # for dead-client pruning
+
+        # Per-client level tracking for RMS normalization.
+        self.recent_rms = deque(maxlen=20)
+        self.target_rms = 0.15              # ~-16 dBFS
 
 
 def get_roster():
@@ -190,8 +161,9 @@ def handle_control_connection(connection, client_address):
                     connection.sendall(f"RTSP/1.0 400 Bad Request\r\nCSeq: {cseq}\r\n\r\n".encode())
                     continue
 
-                client_ssrc = next_ssrc
-                next_ssrc += 1
+                with next_ssrc_lock:
+                    client_ssrc = next_ssrc
+                    next_ssrc += 1
 
                 name = headers.get("X-Display-Name", "").strip() or f"Client {client_ssrc}"
                 new_client = ConnectedClient(client_ssrc, client_address[0], client_rtp_port)
@@ -279,6 +251,14 @@ def receive_audio_from_clients(audio_socket):
                         sender.lost_packets += gap
                 sender.last_sequence = seq
 
+                # Track RMS for per-client level normalization.
+                try:
+                    frame = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+                    rms = float(np.sqrt(np.mean(frame ** 2))) / 32768.0
+                    sender.recent_rms.append(rms)
+                except ValueError:
+                    pass
+
 
 def handle_control_message(msg_type, payload, addr, audio_socket):
     if msg_type == MSG_HEARTBEAT:
@@ -342,8 +322,8 @@ def broadcast_roster(audio_socket):
         for target in targets:
             try:
                 audio_socket.sendto(msg, target)
-            except OSError:
-                pass
+            except OSError as exc:
+                print(f"[roster] sendto failed for {target}: {exc}")
 
 
 def mix_and_send_audio(audio_socket):
@@ -356,58 +336,87 @@ def mix_and_send_audio(audio_socket):
     while True:
         loop_start_time = time.time()
 
+        # Take a snapshot of clients and frames while holding the lock,
+        # then release it before doing network I/O so a slow client
+        # cannot stall mixing for everyone else.
         with clients_lock:
             clients_snapshot = list(connected_clients.values())
 
             frames_by_ssrc = {}
+            muted_set = set()
+            rms_by_ssrc = {}
             for client in clients_snapshot:
                 audio = None
                 if client.audio_frames:
                     audio = client.audio_frames[-1]
                 if audio is not None and len(audio) >= SAMPLES_PER_FRAME * 2:
-                    frames_by_ssrc[client.ssrc] = np.frombuffer(
-                        audio, dtype=np.int16
-                    ).astype(np.int32)
+                    frame = np.frombuffer(audio, dtype=np.int16).astype(np.int32)
+                    frames_by_ssrc[client.ssrc] = frame
+                    # Compute RMS for VAD and normalization.
+                    frame_f32 = frame.astype(np.float32)
+                    rms = float(np.sqrt(np.mean(frame_f32 ** 2))) / 32768.0
+                    rms_by_ssrc[client.ssrc] = rms
                 else:
                     frames_by_ssrc[client.ssrc] = silent_frame
+                    rms_by_ssrc[client.ssrc] = 0.0
+                if client.muted:
+                    muted_set.add(client.ssrc)
 
-            for client in clients_snapshot:
-                other_frames = [
-                    frame for ssrc, frame in frames_by_ssrc.items()
-                    if ssrc != client.ssrc and not connected_clients[ssrc].muted
-                ]
-
-                if other_frames:
-                    mixed_frame = sum(other_frames)
-                    # Normalize by the number of active talkers so a single
-                    # voice isn't quiet and many voices don't clip.
-                    mixed_frame = mixed_frame / len(other_frames)
-                    mixed_frame = (mixed_frame * MIX_GAIN)
-                    mixed_frame = np.tanh(mixed_frame / 32768.0) * 32768.0
-                    mixed_frame = mixed_frame.clip(-32768, 32767).astype(np.int16)
-                else:
-                    mixed_frame = np.zeros(SAMPLES_PER_FRAME, dtype=np.int16)
-
-                packet = build_rtp_packet(
-                    client.outgoing_sequence_number,
-                    client.outgoing_timestamp,
-                    0,  # ssrc 0 means "this is the mixed server output"
-                    mixed_frame.tobytes(),
-                )
-                client.outgoing_sequence_number += 1
-                client.outgoing_timestamp += SAMPLES_PER_FRAME
-
-                # Only send once we've learned the client's NAT-translated
-                # address from an inbound packet. The client's private UDP port
-                # (client.rtp_port) is unreachable across NAT, so we must not
-                # fall back to it.
-                target = client.return_address
-                if target is None:
+        # Mix and send outside the lock.
+        for client in clients_snapshot:
+            other_frames = []
+            for ssrc, frame in frames_by_ssrc.items():
+                if ssrc == client.ssrc or ssrc in muted_set:
                     continue
-                try:
-                    audio_socket.sendto(packet, target)
-                except OSError:
-                    pass  # client's socket may have closed, ignore and continue
+                # Voice activity detection: skip silent frames to keep the
+                # noise floor down.
+                if rms_by_ssrc.get(ssrc, 0.0) < 0.01:
+                    continue
+                # Per-client RMS normalization: boost quiet talkers, tame loud ones.
+                sender = next((c for c in clients_snapshot if c.ssrc == ssrc), None)
+                if sender is not None and sender.recent_rms:
+                    avg_rms = sum(sender.recent_rms) / len(sender.recent_rms)
+                    if avg_rms > 1e-6:
+                        gain = sender.target_rms / avg_rms
+                        gain = min(gain, 8.0)  # cap normalization gain
+                        frame = (frame * gain).astype(np.int32)
+                other_frames.append(frame)
+
+            if other_frames:
+                mixed_frame = sum(other_frames)
+                # Normalize by the number of active talkers so a single
+                # voice isn't quiet and many voices don't clip.
+                mixed_frame = mixed_frame / len(other_frames)
+                mixed_frame = (mixed_frame * MIX_GAIN)
+                # Final mix limiter: prevent clipping and smooth out level jumps.
+                mix_rms = float(np.sqrt(np.mean(mixed_frame.astype(np.float32) ** 2))) / 32768.0
+                if mix_rms > 0.25:
+                    mixed_frame = mixed_frame * (0.25 / mix_rms)
+                mixed_frame = np.tanh(mixed_frame / 32768.0) * 32768.0
+                mixed_frame = mixed_frame.clip(-32768, 32767).astype(np.int16)
+            else:
+                mixed_frame = np.zeros(SAMPLES_PER_FRAME, dtype=np.int16)
+
+            packet = build_rtp_packet(
+                client.outgoing_sequence_number,
+                client.outgoing_timestamp,
+                0,  # ssrc 0 means "this is the mixed server output"
+                mixed_frame.tobytes(),
+            )
+            client.outgoing_sequence_number += 1
+            client.outgoing_timestamp += SAMPLES_PER_FRAME
+
+            # Only send once we've learned the client's NAT-translated
+            # address from an inbound packet. The client's private UDP port
+            # (client.rtp_port) is unreachable across NAT, so we must not
+            # fall back to it.
+            target = client.return_address
+            if target is None:
+                continue
+            try:
+                audio_socket.sendto(packet, target)
+            except OSError as exc:
+                print(f"[mixer] sendto failed for client {client.ssrc}: {exc}")
 
         next_loop_time += FRAME_INTERVAL
         time_spent = time.time() - loop_start_time
@@ -471,7 +480,10 @@ def run_rtsp_server():
     print(f"[rtsp] conference server listening on TCP port {RTSP_PORT}")
 
     while True:
-        connection, client_address = server_socket.accept()
+        try:
+            connection, client_address = server_socket.accept()
+        except OSError:
+            break
         threading.Thread(
             target=handle_control_connection, args=(connection, client_address), daemon=True
         ).start()
@@ -491,10 +503,30 @@ def main():
             print(f"[stun] public address appears to be {public[0]}:{public[1]}")
             print(f"[stun] clients on other networks should connect to that IP/port")
 
-    threading.Thread(target=receive_audio_from_clients, args=(audio_socket,), daemon=True).start()
-    threading.Thread(target=mix_and_send_audio, args=(audio_socket,), daemon=True).start()
-    threading.Thread(target=prune_dead_clients, daemon=True).start()
-    threading.Thread(target=broadcast_roster, args=(audio_socket,), daemon=True).start()
+    threads = [
+        threading.Thread(target=receive_audio_from_clients, args=(audio_socket,), daemon=True),
+        threading.Thread(target=mix_and_send_audio, args=(audio_socket,), daemon=True),
+        threading.Thread(target=prune_dead_clients, daemon=True),
+        threading.Thread(target=broadcast_roster, args=(audio_socket,), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+
+    def shutdown(signum, frame):
+        print("\n[server] shutting down...")
+        try:
+            audio_socket.close()
+        except OSError:
+            pass
+        # Give threads a moment to exit cleanly.
+        for t in threads:
+            if t.is_alive():
+                t.join(timeout=1.0)
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
     run_rtsp_server()
 
 

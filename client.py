@@ -27,51 +27,21 @@ import threading
 import time
 import sys
 import argparse
+import logging
 import numpy as np
 import sounddevice as sd
+from rtp import (
+    build_rtp_packet,
+    parse_rtp_packet,
+    build_control_message,
+    parse_control_message,
+    MSG_HEARTBEAT,
+    MSG_MUTE,
+    MSG_ROSTER,
+)
 
-
-RTP_VERSION = 2
-PAYLOAD_TYPE = 97
-
-# Control message types (must match server.py).
-MSG_HEARTBEAT = 0x01
-MSG_MUTE = 0x02
-MSG_ROSTER = 0x03
-
-
-def build_rtp_packet(sequence_number, timestamp, ssrc, audio_bytes):
-    """Wraps raw audio bytes in a 12 byte RTP header."""
-    byte1 = (RTP_VERSION << 6) | (0 << 5) | (0 << 4)
-    byte2 = PAYLOAD_TYPE
-    header = struct.pack(
-        "!BBHII",
-        byte1,
-        byte2,
-        sequence_number & 0xFFFF,
-        timestamp & 0xFFFFFFFF,
-        ssrc & 0xFFFFFFFF,
-    )
-    return header + audio_bytes
-
-
-def parse_rtp_packet(packet_bytes):
-    """Splits an RTP packet back into its header fields and audio bytes."""
-    header_bytes = packet_bytes[:12]
-    audio_bytes = packet_bytes[12:]
-    _, _, sequence_number, timestamp, ssrc = struct.unpack("!BBHII", header_bytes)
-    return ssrc, sequence_number, timestamp, audio_bytes
-
-
-def build_control_message(msg_type, payload=b""):
-    return struct.pack("!BB", msg_type, len(payload)) + payload
-
-
-def parse_control_message(data):
-    if len(data) < 2:
-        return None, b""
-    msg_type, length = struct.unpack("!BB", data[:2])
-    return msg_type, data[2:2 + length]
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+logger = logging.getLogger("client")
 
 
 
@@ -91,10 +61,11 @@ MIC_GAIN = 1.0
 PLAYBACK_GAIN = 1.2
 
 # Jitter buffer: how many 20ms frames we hold before playing. Larger = more
-# tolerant of jitter/loss, but adds latency.
-JITTER_FRAMES = 6
+# tolerant of jitter/loss, but adds latency. Reduced for low-latency networks
+# like Tailscale / LAN where jitter is typically small.
+JITTER_FRAMES = 3
 # If we miss this many consecutive frames, we still hold the last good frame.
-MAX_CONCEAL = 10
+MAX_CONCEAL = 4
 
 HEARTBEAT_INTERVAL = 2.0
 
@@ -103,8 +74,8 @@ class AudioProcessor:
     """Microphone-side AGC + noise gate so quiet mics are normalized and
     background noise is silenced. Pure NumPy, no external dependencies."""
 
-    def __init__(self, target_peak=0.55, attack=0.02, release=0.002,
-                 noise_floor=0.005, gain_cap=12.0):
+    def __init__(self, target_peak=0.4, attack=0.01, release=0.0005,
+                 noise_floor=0.01, gain_cap=8.0):
         self.target_peak = target_peak
         self.attack = attack
         self.release = release
@@ -287,7 +258,12 @@ class Client:
 
     def on_microphone_audio(self, input_samples, frame_count, time_info, status):
         if status:
-            pass
+            logger.warning("input stream status: %s", status)
+
+        if self.session_ssrc is None:
+            # Not yet joined or already left; drop the frame.
+            return
+
         samples = input_samples[:, 0].astype(np.float32)
 
         peak = float(np.max(np.abs(samples)))
@@ -309,17 +285,21 @@ class Client:
 
         try:
             self.audio_socket.sendto(packet, (self.server_ip, self.server_rtp_port))
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.debug("sendto failed: %s", exc)
 
     def on_speaker_output(self, output_samples, frame_count, time_info, status):
+        if status:
+            logger.warning("output stream status: %s", status)
+
         if self.speaker_muted:
             output_samples[:, 0] = 0.0
             return
 
         try:
             frame = self.jitter.pop()
-        except Exception:
+        except Exception as exc:
+            logger.debug("jitter buffer pop failed: %s", exc)
             frame = np.zeros(SAMPLES_PER_FRAME, dtype=np.int16)
 
         with self.peak_lock:
@@ -334,7 +314,8 @@ class Client:
                 packet_bytes, _ = self.audio_socket.recvfrom(2048)
             except socket.timeout:
                 continue
-            except OSError:
+            except OSError as exc:
+                logger.info("receive thread exiting: %s", exc)
                 break
 
             if len(packet_bytes) < 2:
@@ -391,8 +372,8 @@ class Client:
         try:
             self.audio_socket.sendto(build_control_message(MSG_MUTE, payload),
                                      (self.server_ip, self.server_rtp_port))
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.debug("send mute state failed: %s", exc)
 
     def heartbeat_loop(self):
         while self.call_active:
@@ -401,8 +382,8 @@ class Client:
                 try:
                     self.audio_socket.sendto(build_control_message(MSG_HEARTBEAT, payload),
                                              (self.server_ip, self.server_rtp_port))
-                except OSError:
-                    pass
+                except OSError as exc:
+                    logger.debug("heartbeat send failed: %s", exc)
             time.sleep(HEARTBEAT_INTERVAL)
 
     def start(self):
@@ -429,10 +410,13 @@ class Client:
         try:
             self.input_stream.stop()
             self.input_stream.close()
+        except Exception as exc:
+            logger.debug("input stream close failed: %s", exc)
+        try:
             self.output_stream.stop()
             self.output_stream.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("output stream close failed: %s", exc)
         sys.stdout.write("\r" + " " * 60 + "\r")
         sys.stdout.flush()
         self.leave_call()
